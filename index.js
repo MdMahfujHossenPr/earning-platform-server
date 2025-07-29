@@ -14,10 +14,12 @@ const admin = require("firebase-admin");
  
 
 // === FIREBASE INIT ===
-admin.initializeApp({
-  credential: admin.credential.cert(path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT)),
-});
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 // === EXPRESS APP ===
 const app = express();
 const corsOptions = {
