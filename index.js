@@ -93,14 +93,16 @@ const submissionSchema = new Schema({
 const Submission = model("Submission", submissionSchema);
 
 // Payment Schema
-const paymentSchema = new Schema({
-  buyer_id: { type: String, required: true },  // Store buyer_id as String (Firebase UID)
-  amount: { type: Number, required: true },
-  coin: { type: Number, required: true },
-  payment_date: { type: Date, default: Date.now },
+const paymentSchema = new mongoose.Schema({
+  buyer_id: mongoose.Schema.Types.ObjectId,
+  amount: Number,
+  coin: Number,
   stripe_id: String,
-}, { timestamps: true });
-
+  status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+  createdAt: { type: Date, default: Date.now }
+});
+ 
+  
 const Payment = model("Payment", paymentSchema);
 
 module.exports = { User, Task, Submission, Payment };
@@ -193,18 +195,22 @@ app.post("/api/upload-img", authMiddleware, async (req, res) => {
 // --- Auth Routes ---
 app.get("/api/users", async (req, res) => {
   try {
-    // Correct way to fetch workers
-    const users = await User.find({ role: "Worker" }).limit(6);
-    
-    if (users.length === 0) {
-      console.error("No workers found in database");
-      return res.status(404).json({ message: "No workers found" });
+    const roleFilter = req.query.role; // ?role=Worker ইত্যাদি
+
+    let filter = {};
+    if (roleFilter) {
+      filter.role = roleFilter;
     }
 
-    console.log("Fetched users: ", users);
+    const users = await User.find(filter).limit(100); // limit 100 or remove limit as needed
+
+    if (users.length === 0) {
+      return res.status(404).json({ message: "No users found" });
+    }
+
     res.status(200).json(users);
   } catch (error) {
-    console.error("Error fetching users:", error);  // Log detailed error
+    console.error("Error fetching users:", error);
     res.status(500).json({ message: "Server error while fetching users" });
   }
 });
@@ -677,13 +683,12 @@ app.post("/api/payment/create", authMiddleware, async (req, res) => {
   }
 });
 
-// Complete Payment and Update User Coins
+// Complete Payment and Save as Pending (No coin update yet)
 app.post("/api/payments/complete-payment", authMiddleware, async (req, res) => {
   const { paymentMethodId, paymentIntentId, userId, coins } = req.body;
 
   console.log('Looking for user with Firebase UID:', userId);
 
-  // Check if all required fields are provided
   if (!paymentMethodId || !paymentIntentId || !userId || !coins) {
     return res.status(400).json({ success: false, message: "Missing required fields" });
   }
@@ -692,39 +697,32 @@ app.post("/api/payments/complete-payment", authMiddleware, async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
     if (paymentIntent.status === 'succeeded') {
-      console.log("Payment already succeeded, updating user coins.");
+      console.log("Payment succeeded, saving payment as pending approval.");
 
-      // Ensure userId is always a string (Firebase UID is string)
       const userUid = userId && typeof userId === 'string' ? userId : String(userId);
       console.log("Firebase UID (converted):", userUid);
 
-      // Fetch user using Firebase UID correctly
-      const user = await User.findOne({ uid: userUid }); // Use Firebase UID for MongoDB query
-      console.log("User from DB:", user);
-      
+      const user = await User.findOne({ uid: userUid });
       if (!user) {
         console.log("User not found");
         return res.status(404).json({ success: false, message: "User not found" });
       }
 
-      // Update user coins after payment success
-      user.coin = (user.coin || 0) + coins;
-      await user.save();
-
-      // Save payment information in MongoDB
+      // Save payment with status "pending" instead of updating coins
       const payment = new Payment({
-        buyer_id: user._id,  // Store MongoDB ObjectId
-        amount: paymentIntent.amount_received / 100,  // Amount in dollars
+        buyer_id: user._id,
+        amount: paymentIntent.amount_received / 100,
         coin: coins,
         stripe_id: paymentIntent.id,
+        status: "pending"   // <-- New field, pending status
       });
 
       await payment.save();
 
-      return res.json({ success: true, message: "Payment successful, coins added" });
+      return res.json({ success: true, message: "Payment recorded and pending admin approval." });
     }
 
-    // Confirm payment if it was not successful
+    // Confirm payment if not yet succeeded
     const confirmPaymentIntent = await stripe.paymentIntents.confirm(paymentIntentId, {
       payment_method: paymentMethodId,
     });
@@ -733,52 +731,58 @@ app.post("/api/payments/complete-payment", authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: "Payment not completed" });
     }
 
-    // Ensure userId is always a string (Firebase UID is string)
-    const userUid = userId && typeof userId === 'string' ? userId : String(userId);  // Ensure the userId is a string
+    const userUid = userId && typeof userId === 'string' ? userId : String(userId);
 
-    const user = await User.findOne({ uid: userUid }); // Query by Firebase UID
+    const user = await User.findOne({ uid: userUid });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    user.coin = (user.coin || 0) + coins;
-    await user.save();
-
-    // Create and save payment info
+    // Save payment with status pending here as well
     const payment = new Payment({
-      buyer_id: user._id,  // MongoDB ObjectId
-      amount: confirmPaymentIntent.amount_received / 100,  // Amount in dollars
+      buyer_id: user._id,
+      amount: confirmPaymentIntent.amount_received / 100,
       coin: coins,
       stripe_id: confirmPaymentIntent.id,
+      status: "pending"
     });
 
     await payment.save();
 
-    res.json({ success: true, message: "Payment successful, coins added" });
+    res.json({ success: true, message: "Payment recorded and pending admin approval." });
   } catch (error) {
-    console.error("Error completing payment:", error); // Detailed logging
+    console.error("Error completing payment:", error);
     res.status(500).json({ success: false, message: "Server error during payment", error: error.message });
   }
 });
 
-// Example of backend route querying Payments
+
+// Assuming User model has a field `uid` storing Firebase UID
 app.get("/api/payments", authMiddleware, async (req, res) => {
-  const { userId } = req.query;
-
-  if (!userId) {
-    return res.status(400).json({ error: "User ID is required" });
-  }
-
   try {
-    // Ensure userId is a valid ObjectId (though we are using Firebase UID here)
-    const userPayments = await Payment.find({ buyer_id: userId });
+    const { userId } = req.query;
+    if (!userId) {
+      return res.status(400).json({ message: "User ID is required" });
+    }
 
-    res.json(userPayments);  // Send payments back
-  } catch (err) {
-    console.error("Error fetching payments:", err);
-    res.status(500).json({ error: "Failed to fetch payments" });
+    // ইউজার পাওয়ার জন্য
+    const user = await User.findOne({ uid: userId });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // payment collection থেকে buyer_id ফিল্ডে User _id অনুসারে ডেটা আনা
+    const payments = await Payment.find({ buyer_id: user._id }).sort({ createdAt: -1 });
+
+    return res.status(200).json(payments);
+  } catch (error) {
+    console.error("Error fetching payments:", error);
+    res.status(500).json({ message: "Server error fetching payments" });
   }
 });
+
+ 
+
 
 
 // --- Withdrawal Routes (Worker) ---
@@ -919,33 +923,38 @@ const getBuyerStatsFromDB = async (userId) => {
 };
 
 // === API ENDPOINT TO GET BUYER STATS ===
-app.get('/api/buyer/stats/:userId', async (req, res) => {
+app.get("/api/buyer/stats/:userId", async (req, res) => {
+  const userId = req.params.userId;
+
   try {
-    const userId = req.params.userId;
-    if (!userId) {
-      return res.status(400).json({ message: 'User ID is required.' });
-    }
+    // Fetch total tasks created by the buyer
+    const totalTasks = await Task.countDocuments({ buyer_id: userId });
 
-    // Log the received userId
-    console.log(`Received userId: ${userId}`);
+    // Fetch total required_workers count for pending tasks
+    const pendingTasks = await Task.aggregate([
+      { $match: { buyer_id: userId } },
+      { $group: { _id: null, totalWorkers: { $sum: "$required_workers" } } },
+    ]);
 
-    // Fetch stats from DB
-    const stats = await getBuyerStatsFromDB(userId);
+    // Fetch total payments made by the buyer (assuming payments are stored in a Payment collection)
+    const totalPayments = await Payment.aggregate([
+      { $match: { buyer_id: userId } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
 
-    // Log the stats
-    console.log(`Fetched stats: ${JSON.stringify(stats)}`);
-
-    if (!stats) {
-      return res.status(404).json({ message: 'No stats found for this user.' });
-    }
-
-    // Return the stats
-    res.json(stats);
+    res.json({
+      totalTasks,
+      pendingTasks: pendingTasks.length > 0 ? pendingTasks[0].totalWorkers : 0,
+      totalPayments: totalPayments.length > 0 ? totalPayments[0].total : 0,
+    });
   } catch (error) {
-    console.error("Error in getting buyer stats:", error);
-    res.status(500).json({ message: 'Internal Server Error', error: error.message });
+    console.error("Error fetching buyer stats:", error);
+    res.status(500).json({ error: "Failed to fetch buyer stats" });
   }
 });
+
+
+
 
 // --- Admin Routes ---
 app.get(
@@ -967,6 +976,59 @@ app.get(
     });
   }
 );
+
+app.post(
+  "/api/payments/approve",
+  authMiddleware,
+  roleMiddleware("Admin"),
+  async (req, res) => {
+    try {
+      const { paymentId } = req.body;
+
+      const payment = await Payment.findById(paymentId);
+      if (!payment) return res.status(404).json({ message: "Payment not found" });
+
+      if (payment.status === "approved") {
+        return res.status(400).json({ message: "Payment already approved" });
+      }
+
+      // Approve the payment
+      payment.status = "approved";
+      await payment.save();
+
+      // Update user's coin
+      const user = await User.findById(payment.buyer_id);
+      if (!user) return res.status(404).json({ message: "Buyer not found" });
+
+      user.coin = (user.coin || 0) + (payment.coin || 0);
+      await user.save();
+
+      // Optional: Create Notification for buyer
+      await Notification.create({
+        toEmail: user.email,
+        message: `Your payment of $${payment.amount} is approved and ${payment.coin} coins added to your account.`,
+        actionRoute: "/dashboard/buyer-home",
+      });
+
+      res.status(200).json({ message: "Payment approved and coins added to buyer" });
+    } catch (error) {
+      console.error("Error approving payment:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  }
+);
+
+
+
+app.get("/api/payments/pending", authMiddleware, roleMiddleware("Admin"), async (req, res) => {
+  try {
+    const pendingPayments = await Payment.find({ status: "pending" }).populate("buyer_id", "name email");
+    res.status(200).json(pendingPayments);
+  } catch (error) {
+    console.error("Error fetching pending payments:", error);
+    res.status(500).json({ message: "Failed to fetch pending payments" });
+  }
+});
 
 // --- User Routes ---
 app.get(
@@ -1003,6 +1065,18 @@ app.put(
     res.json(user);
   }
 );
+
+app.patch('/api/users/:id', async (req, res) => {
+  const userId = req.params.id;
+  const { role } = req.body;
+  try {
+    const updatedUser = await User.findByIdAndUpdate(userId, { role }, { new: true });
+    if (!updatedUser) return res.status(404).send('User not found');
+    res.json(updatedUser);
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
 
 app.get(
   "/api/admin/tasks",
