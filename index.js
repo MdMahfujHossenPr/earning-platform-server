@@ -8,10 +8,10 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const axios = require("axios");
-const Stripe = require("stripe");
 const path = require("path");
 const admin = require("firebase-admin");
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+ 
 
 // === FIREBASE INIT ===
 admin.initializeApp({
@@ -45,6 +45,7 @@ const generateToken = (user) => {
 // === MODELS ===
 const { Schema, model } = mongoose;
 
+// User Schema
 const userSchema = new Schema({
   name: String,
   email: { type: String, unique: true },
@@ -53,13 +54,12 @@ const userSchema = new Schema({
   role: { type: String, enum: ["Worker", "Buyer", "Admin"], default: "Worker" },
   coin: { type: Number, default: 0 },
   googleId: String,
-  uid: { type: String, required: true, unique: true }, // Add uid here to store Firebase UID
+  uid: { type: String, required: true, unique: true, index: true } // Firebase UID as String and Indexed
 }, { timestamps: true });
 
 const User = model("User", userSchema);
 
- 
-
+// Task Schema
 const taskSchema = new Schema({
   task_title: String,
   task_detail: String,
@@ -68,13 +68,15 @@ const taskSchema = new Schema({
   completion_date: Date,
   submission_info: String,
   task_image_url: String,
-  buyer_id: { type: Schema.Types.ObjectId, ref: "User" },
+  buyer_id: { type: String, required: true },  // Store buyer_id as String for Firebase UID
   buyer_name: String,
   buyer_email: String,
   submissions: [{ type: Schema.Types.ObjectId, ref: "Submission" }],
 }, { timestamps: true });
+
 const Task = model("Task", taskSchema);
 
+// Submission Schema
 const submissionSchema = new Schema({
   task_id: { type: Schema.Types.ObjectId, ref: "Task" },
   task_title: String,
@@ -87,16 +89,24 @@ const submissionSchema = new Schema({
   status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
   current_date: { type: Date, default: Date.now },
 }, { timestamps: true });
+
 const Submission = model("Submission", submissionSchema);
 
+// Payment Schema
 const paymentSchema = new Schema({
-  buyer_id: { type: Schema.Types.ObjectId, ref: "User" },
-  amount: Number,
-  coin: Number,
+  buyer_id: { type: String, required: true },  // Store buyer_id as String (Firebase UID)
+  amount: { type: Number, required: true },
+  coin: { type: Number, required: true },
   payment_date: { type: Date, default: Date.now },
   stripe_id: String,
 }, { timestamps: true });
+
 const Payment = model("Payment", paymentSchema);
+
+module.exports = { User, Task, Submission, Payment };
+
+
+  
 
 const withdrawalSchema = new Schema({
   worker_id: { type: Schema.Types.ObjectId, ref: "User" },
@@ -125,24 +135,18 @@ const verifyFirebaseToken = async (req, res, next) => {
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ error: "Unauthorized: No token provided" });
   }
+
   const token = authHeader.split(" ")[1];
   try {
     const decodedUser = await admin.auth().verifyIdToken(token);
-    
-    // Set req.user with decoded data
     req.user = decodedUser;
-    
-    // Explicitly set req.user.id
-    req.user.id = decodedUser.uid;  // Assuming uid from Firebase is used as the user ID
-
-    console.log('Decoded user:', req.user);  // Debugging: Log the decoded user
-    
+    console.log("Decoded user from Firebase:", req.user);
+    req.user.id = decodedUser.uid;
     next();
   } catch (error) {
     return res.status(403).json({ error: "Forbidden: Invalid token" });
   }
 };
-
 
 
 const checkRole = (requiredRole) => async (req, res, next) => {
@@ -157,30 +161,6 @@ const checkRole = (requiredRole) => async (req, res, next) => {
 
 const authMiddleware = verifyFirebaseToken;
 const roleMiddleware = checkRole;
-
-// --- Stripe Payment Route ---
-app.post("/api/payments", authMiddleware, roleMiddleware("Buyer"), async (req, res) => {
-  const { coin, amount } = req.body;
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount * 100,  // amount is in cents
-      currency: 'usd',  // Currency can be adjusted as needed
-      description: 'Coin Purchase',
-      payment_method: req.body.payment_method,  // Payment method passed from frontend
-      confirm: true,
-    });
-
-    const buyer = await User.findById(req.user.id);
-    buyer.coin += coin;
-    await buyer.save();
-
-    const payment = await Payment.create({ buyer_id: buyer._id, coin, amount });
-    res.json(payment);
-  } catch (error) {
-    console.error("Stripe Payment Error:", error);
-    res.status(500).json({ message: "Payment failed", error: error.message });
-  }
-});
 
 // --- Image Upload Route ---
 app.post("/api/upload-img", authMiddleware, async (req, res) => {
@@ -229,7 +209,6 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
-
 // Users - Register
 app.post("/api/users", async (req, res) => {
   let { name, photoURL, email, password, method, role } = req.body;
@@ -239,41 +218,66 @@ app.post("/api/users", async (req, res) => {
   if (!role) role = "Worker";
 
   try {
+    // Check if the email already exists in Firebase
+    let firebaseUser;
+    try {
+      firebaseUser = await admin.auth().getUserByEmail(email);  // Check if user exists in Firebase
+    } catch (error) {
+      // If error is thrown, it means the user doesn't exist
+      if (error.code !== 'auth/user-not-found') {
+        return res.status(500).json({ message: "Error checking Firebase user", error: error.message });
+      }
+    }
+
+    if (!firebaseUser) {
+      // If the user doesn't exist, create the user in Firebase
+      if (method === "google") {
+        firebaseUser = await admin.auth().createUser({
+          email,
+          displayName: name,
+          photoURL,
+        });
+      } else if (method === "manual") {
+        if (!password) return res.status(400).json({ message: "Password required" });
+        const hashedPassword = await bcrypt.hash(password, 10);
+        firebaseUser = await admin.auth().createUser({
+          email,
+          password: hashedPassword,
+          displayName: name,
+          photoURL,
+        });
+      } else {
+        return res.status(400).json({ message: "Invalid method" });
+      }
+    }
+
+    // Firebase UID
+    const firebaseUid = firebaseUser.uid;
+
+    // Check if the user already exists in MongoDB
     const existingUser = await User.findOne({ email });
-    if (existingUser) return res.status(400).json({ message: "User already exists" });
+    if (existingUser) {
+      return res.status(200).json({ message: "User already exists", user: existingUser });
+    }
 
+    // Create the user in MongoDB
     const coinValue = role === "Buyer" ? 50 : 10;
+    const user = {
+      name,
+      photo_url: photoURL,
+      email,
+      role,
+      coin: coinValue,
+      uid: firebaseUid,  // Firebase UID added
+    };
 
-    if (method === "google") {
-      const user = { name, photo_url: photoURL, email, googleId: "", role, coin: coinValue };
-      const result = await User.create(user);
-      return res.status(201).json({ message: "Google user created", user: result });
-    }
+    const result = await User.create(user);
+    return res.status(201).json({ message: "User created", user: result });
 
-    if (method === "manual") {
-      if (!password) return res.status(400).json({ message: "Password required" });
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const user = { name, photo_url: photoURL, email, password: hashedPassword, role, coin: coinValue };
-      const result = await User.create(user);
-      return res.status(201).json({ message: "Manual user created", user: result });
-    }
-
-    return res.status(400).json({ message: "Invalid method" });
   } catch (error) {
     console.error("User creation error:", error);
     res.status(500).json({ message: "User creation failed", error: error.message });
   }
-});
-
-
-// --- Stripe Integration for Payment ---
-app.post("/api/payments", authMiddleware, roleMiddleware("Buyer"), async (req, res) => {
-  const { coin, amount } = req.body;
-  const buyer = await User.findById(req.user.id);
-  buyer.coin += coin;
-  await buyer.save();
-  const payment = await Payment.create({ buyer_id: buyer._id, coin, amount });
-  res.json(payment);
 });
 
 app.get('/users/role/:email', async (req, res) => {
@@ -281,13 +285,14 @@ app.get('/users/role/:email', async (req, res) => {
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: "User not found" });
-    res.json({ role: user.role });
+    
+    // Send both role and coin
+    res.json({ role: user.role, coin: user.coin });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
- 
 // Google login (Firebase ID token verify)
 app.post("/api/google-login", async (req, res) => {
   const { idToken, role } = req.body;
@@ -308,7 +313,6 @@ app.post("/api/google-login", async (req, res) => {
   }
 });
 
-
 // Users - Login
 app.post("/login", async (req, res) => {
   try {
@@ -318,23 +322,20 @@ app.post("/login", async (req, res) => {
       return res.status(400).json({ message: "Email and method are required" });
     }
 
-    // Handle Google login (or other methods)
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Logic to handle user login
     const token = generateToken(user); // Ensure this method exists and works
     res.status(200).json({ message: "Login successful", token });
-
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ message: "Server error during login", error: error.message });
   }
 });
 
-
+ 
 // --- User Profile & Coin ---
 app.get("/api/profile", authMiddleware, async (req, res) => {
   const user = await User.findById(req.user.id);
@@ -359,7 +360,7 @@ app.post("/api/tasks", authMiddleware, roleMiddleware("Buyer"), async (req, res)
       task_image_url,
     } = req.body;
 
-    // Create task in the database
+    // Task creation
     const task = await Task.create({
       task_title: task_title.trim(),
       task_detail: task_detail.trim(),
@@ -377,7 +378,9 @@ app.post("/api/tasks", authMiddleware, roleMiddleware("Buyer"), async (req, res)
 
     // Deduct coins from buyer
     const buyer = await User.findById(req.user._id);
-    buyer.coin -= task.required_workers * task.payable_amount;
+    const totalDeduction = task.required_workers * task.payable_amount;
+    console.log("Total Deduction (After Calculation):", totalDeduction);
+    buyer.coin -= totalDeduction;
     await buyer.save();
 
     res.status(201).json(task);
@@ -386,6 +389,7 @@ app.post("/api/tasks", authMiddleware, roleMiddleware("Buyer"), async (req, res)
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 // Get tasks (fetch all tasks)
 app.get("/api/tasks", authMiddleware, async (req, res) => {
@@ -498,20 +502,18 @@ app.delete("/api/tasks/:id", authMiddleware, roleMiddleware("Buyer"), async (req
   }
 });
 
+//Submissions Route 
 app.post("/api/submissions", authMiddleware, roleMiddleware("Worker"), async (req, res) => {
   const { task_id, submission_details, worker_name, worker_email, buyer_name, buyer_email, status } = req.body;
 
-  // Ensure worker_name is passed
   if (!worker_name) {
     return res.status(400).json({ message: "Worker name is required" });
   }
 
-  // Ensure submission_details is provided
   if (!submission_details) {
     return res.status(400).json({ message: "Submission details are required" });
   }
 
-  // Validate task_id as a valid ObjectId
   if (!mongoose.Types.ObjectId.isValid(task_id)) {
     return res.status(400).json({ message: "Invalid task ID" });
   }
@@ -519,31 +521,29 @@ app.post("/api/submissions", authMiddleware, roleMiddleware("Worker"), async (re
   const taskObjectId = new mongoose.Types.ObjectId(task_id);
 
   try {
-    console.log('Received Task ID:', task_id); // Debug log to check task ID
-
-    // Fetch the task from the database using the task ID
+    // Check if the task exists
     const task = await Task.findById(taskObjectId);
     if (!task) {
       console.error('Task not found');
       return res.status(400).json({ message: "Task not found" });
     }
 
-    // Check if required workers are available
+    // Check if the task requires workers
     if (task.required_workers <= 0) {
       console.error('No workers needed for this task');
       return res.status(400).json({ message: "No workers needed for this task" });
     }
 
-    // Find the worker submitting the task using the firebase UID
-    const worker = await User.findOne({ uid: req.user.id }); // Use uid instead of _id
+    // Find the worker in the database
+    const worker = await User.findOne({ email: worker_email });
     if (!worker) {
       console.error('Worker not found');
       return res.status(400).json({ message: "Worker not found" });
     }
 
-    console.log('Worker found:', worker.name);
+    console.log('Task Submission Data:', req.body); // Debugging log for submission data
 
-    // Create a new task submission
+    // Create a new submission
     const submission = await Submission.create({
       task_id: taskObjectId,
       task_title: task.task_title,
@@ -556,33 +556,25 @@ app.post("/api/submissions", authMiddleware, roleMiddleware("Worker"), async (re
       status: status || "pending", // Default to 'pending' if not provided
     });
 
-    console.log('Task Submission Created:', submission);
-
-    // Update task to reflect the new submission and decrement the required_workers
+    // Update the task's submission and required workers
     task.submissions.push(submission._id);
     task.required_workers -= 1;
     await task.save(); // Save the task after updating it
 
-    // Create a notification for the Buyer about the worker submission
+    // Create a notification for the Buyer
     await Notification.create({
       message: `${worker.name} submitted for ${task.task_title}`,
       toEmail: task.buyer_email,
       actionRoute: "/dashboard/buyer-home",
     });
 
-    // Send the submission data as a response
     res.status(201).json(submission); // Return the created submission
 
   } catch (error) {
-    console.error("Error in task submission:", error);  // Log the error details for debugging
+    console.error("Error in task submission:", error);
     res.status(500).json({ message: "Server error while submitting task", error: error.message });
   }
 });
-
-
-
-
-
 
 // Get submissions (Worker or Buyer)
 app.get("/api/submissions", authMiddleware, async (req, res) => {
@@ -600,36 +592,35 @@ app.get("/api/submissions", authMiddleware, async (req, res) => {
   res.json(submissions); // Return the list of submissions
 });
 
-
-
-
-
 // Approve/Reject Submission (Buyer)
-app.post(
-  "/api/submissions/:id/approve",
-  authMiddleware,
-  roleMiddleware("Buyer"),
-  async (req, res) => {
-    const submission = await Submission.findById(req.params.id);
-    if (!submission)
-      return res.status(404).json({ message: "Submission not found" });
-    if (submission.buyer_email !== req.user.email)
-      return res.status(403).json({ message: "Forbidden" });
-    submission.status = "approved";
-    await submission.save();
-    // Increase worker coin
-    const worker = await User.findOne({ email: submission.worker_email });
-    worker.coin += submission.payable_amount;
-    await worker.save();
-    // Notification to Worker
-    await Notification.create({
-      message: `You have earned ${submission.payable_amount} from ${submission.buyer_name} for completing ${submission.task_title}`,
-      toEmail: worker.email,
-      actionRoute: "/dashboard/worker-home",
-    });
-    res.json(submission);
+app.post("/api/submissions/:id/approve", authMiddleware, roleMiddleware("Buyer"), async (req, res) => {
+  const submission = await Submission.findById(req.params.id); // Get submission by ID
+  if (!submission) {
+    return res.status(404).json({ message: "Submission not found" });
   }
-);
+  if (submission.buyer_email !== req.user.email) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  
+  // Approve the submission
+  submission.status = "approved";
+  await submission.save();
+
+  // Increase worker's coin balance
+  const worker = await User.findOne({ email: submission.worker_email });
+  worker.coin += submission.payable_amount;
+  await worker.save();
+
+  // Create notification for the worker
+  await Notification.create({
+    message: `You have earned ${submission.payable_amount} from ${submission.buyer_name} for completing ${submission.task_title}`,
+    toEmail: worker.email,
+    actionRoute: "/dashboard/worker-home",
+  });
+  // Respond with the approved submission
+  res.json(submission);
+});
+
 
 // Reject Submission (Buyer)
 app.post(
@@ -658,82 +649,171 @@ app.post(
   }
 );
 
-// --- Payment Routes (Buyer) ---
-app.post("/api/payments", verifyFirebaseToken, checkRole("Buyer"), async (req, res) => {
-  const { coin, amount } = req.body;
+
+
+const Stripe = require("stripe");
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+ 
+// Create Payment Intent
+app.post("/api/payment/create", authMiddleware, async (req, res) => {
+  const { amount, coin } = req.body;
+
+  if (coin === undefined) {
+    return res.status(400).json({ error: "Coin value is missing in the request body" });
+  }
+
   try {
-    // Create Stripe payment intent
+    const amountInCents = amount * 100;
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount * 100,  // Convert to cents
-      currency: 'usd',
-      description: 'Coin Purchase',
-      payment_method: req.body.payment_method,  // Payment method passed from frontend
-      confirm: true,
+      amount: amountInCents,
+      currency: "usd",
+      description: "Coin purchase",
     });
 
-    const buyer = await User.findById(req.user.id);
-    buyer.coin += coin;
-    await buyer.save();
-
-    // Create payment record
-    const payment = await Payment.create({
-      buyer_id: buyer._id,
-      coin,
-      amount,
-      stripe_id: paymentIntent.id,  // Store the Stripe payment ID
-    });
-
-    res.json({ id: paymentIntent.id });
+    res.status(200).json({ clientSecret: paymentIntent.client_secret });
   } catch (error) {
-    console.error("Stripe Payment Error:", error);
-    res.status(500).json({ message: "Payment failed", error: error.message });
+    console.error("Error creating payment intent:", error);
+    res.status(500).json({ error: "Payment intent creation failed" });
   }
 });
 
+// Complete Payment and Update User Coins
+app.post("/api/payments/complete-payment", authMiddleware, async (req, res) => {
+  const { paymentMethodId, paymentIntentId, userId, coins } = req.body;
 
-// Get payments (Buyer)
-app.get('/api/payments', verifyFirebaseToken, async (req, res) => {
-  const { userId } = req.query; // Get the user ID from the query params
+  console.log('Looking for user with Firebase UID:', userId);
+
+  // Check if all required fields are provided
+  if (!paymentMethodId || !paymentIntentId || !userId || !coins) {
+    return res.status(400).json({ success: false, message: "Missing required fields" });
+  }
+
   try {
-    const payments = await Payment.find({ buyer_id: userId }).sort({ payment_date: -1 }); // Fetch payments for the user
-    res.json(payments); // Return the payments data
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (paymentIntent.status === 'succeeded') {
+      console.log("Payment already succeeded, updating user coins.");
+
+      // Ensure userId is always a string (Firebase UID is string)
+      const userUid = userId && typeof userId === 'string' ? userId : String(userId);
+      console.log("Firebase UID (converted):", userUid);
+
+      // Fetch user using Firebase UID correctly
+      const user = await User.findOne({ uid: userUid }); // Use Firebase UID for MongoDB query
+      console.log("User from DB:", user);
+      
+      if (!user) {
+        console.log("User not found");
+        return res.status(404).json({ success: false, message: "User not found" });
+      }
+
+      // Update user coins after payment success
+      user.coin = (user.coin || 0) + coins;
+      await user.save();
+
+      // Save payment information in MongoDB
+      const payment = new Payment({
+        buyer_id: user._id,  // Store MongoDB ObjectId
+        amount: paymentIntent.amount_received / 100,  // Amount in dollars
+        coin: coins,
+        stripe_id: paymentIntent.id,
+      });
+
+      await payment.save();
+
+      return res.json({ success: true, message: "Payment successful, coins added" });
+    }
+
+    // Confirm payment if it was not successful
+    const confirmPaymentIntent = await stripe.paymentIntents.confirm(paymentIntentId, {
+      payment_method: paymentMethodId,
+    });
+
+    if (confirmPaymentIntent.status !== "succeeded") {
+      return res.status(400).json({ success: false, message: "Payment not completed" });
+    }
+
+    // Ensure userId is always a string (Firebase UID is string)
+    const userUid = userId && typeof userId === 'string' ? userId : String(userId);  // Ensure the userId is a string
+
+    const user = await User.findOne({ uid: userUid }); // Query by Firebase UID
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    user.coin = (user.coin || 0) + coins;
+    await user.save();
+
+    // Create and save payment info
+    const payment = new Payment({
+      buyer_id: user._id,  // MongoDB ObjectId
+      amount: confirmPaymentIntent.amount_received / 100,  // Amount in dollars
+      coin: coins,
+      stripe_id: confirmPaymentIntent.id,
+    });
+
+    await payment.save();
+
+    res.json({ success: true, message: "Payment successful, coins added" });
   } catch (error) {
-    console.error('Error fetching payments:', error);
-    res.status(500).json({ message: 'Error fetching payments' }); // Handle errors
+    console.error("Error completing payment:", error); // Detailed logging
+    res.status(500).json({ success: false, message: "Server error during payment", error: error.message });
+  }
+});
+
+// Example of backend route querying Payments
+app.get("/api/payments", authMiddleware, async (req, res) => {
+  const { userId } = req.query;
+
+  if (!userId) {
+    return res.status(400).json({ error: "User ID is required" });
+  }
+
+  try {
+    // Ensure userId is a valid ObjectId (though we are using Firebase UID here)
+    const userPayments = await Payment.find({ buyer_id: userId });
+
+    res.json(userPayments);  // Send payments back
+  } catch (err) {
+    console.error("Error fetching payments:", err);
+    res.status(500).json({ error: "Failed to fetch payments" });
   }
 });
 
 
 // --- Withdrawal Routes (Worker) ---
-app.post(
-  "/api/withdrawals",
-  authMiddleware,
-  roleMiddleware("Worker"),
-  async (req, res) => {
-    const { withdrawal_coin, payment_system, account_number } = req.body;
-    const worker = await User.findById(req.user.id);
-    if (worker.coin < withdrawal_coin || withdrawal_coin < 200)
-      return res.status(400).json({ message: "Insufficient coin" });
-    const withdrawal_amount = withdrawal_coin / 20;
-    const withdrawal = await Withdrawal.create({
-      worker_id: worker._id,
-      worker_email: worker.email,
-      worker_name: worker.name,
+app.post("/api/withdrawals", authMiddleware, async (req, res) => {
+  try {
+    const { worker_email, worker_name, withdrawal_coin, withdrawal_amount, payment_system, account_number } = req.body;
+
+    // Ensure the worker has sufficient coins
+    const worker = await User.findOne({ email: worker_email });
+    if (!worker || worker.coin < withdrawal_coin) {
+      return res.status(400).json({ message: "Insufficient coins for withdrawal" });
+    }
+
+    // Save the withdrawal request
+    const withdrawal = new Withdrawal({
+      worker_email,
+      worker_name,
       withdrawal_coin,
       withdrawal_amount,
       payment_system,
       account_number,
-      status: "pending",
+      withdraw_date: new Date(),
+      status: "pending"
     });
-    // Notification to Admin
-    await Notification.create({
-      message: `${worker.name} requested withdrawal of ${withdrawal_amount}$`,
-      toEmail: "mdmahfujhossen.pr@gmail.com",
-      actionRoute: "/dashboard/admin-home",
-    });
-    res.json(withdrawal);
+
+    await withdrawal.save();  // Save to DB
+    worker.coin -= withdrawal_coin;  // Update worker's coin balance
+    await worker.save();
+
+    res.status(201).json(withdrawal);  // Respond with the saved withdrawal
+  } catch (error) {
+    console.error("Error in withdrawal process:", error);
+    res.status(500).json({ message: "Error processing withdrawal", error: error.message });
   }
-);
+});
 
 app.get("/api/withdrawals", authMiddleware, async (req, res) => {
   let withdrawals;
@@ -749,6 +829,17 @@ app.get("/api/withdrawals", authMiddleware, async (req, res) => {
     withdrawals = [];
   }
   res.json(withdrawals);
+});
+
+// Fetch withdrawal requests for workers and admin
+app.get("/api/withdraw/requests", authMiddleware, roleMiddleware("Admin"), async (req, res) => {
+  try {
+    const requests = await Withdrawal.find({ status: "pending" }).populate("worker_id", "name email");
+    res.status(200).json(requests);
+  } catch (error) {
+    console.error("Error fetching withdrawal requests:", error);
+    res.status(500).json({ message: "Failed to fetch withdrawal requests" });
+  }
 });
 
 // Admin approves withdrawal
@@ -777,29 +868,84 @@ app.post(
 );
 
 // --- Notification Routes ---
-app.get("/api/notifications", authMiddleware, async (req, res) => {
-  const notifications = await Notification.find({
-    toEmail: req.user.email,
-  }).sort({ time: -1 });
-  res.json(notifications);
-});
-
-// Backend route to fetch buyer stats
-app.get("/api/buyer/stats/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;  // Access the userId from the URL parameter
-  if (!userId) {
-    return res.status(400).json({ message: "User ID is required" });
-  }
+app.get('/api/notifications', authMiddleware, async (req, res) => {
+  const { email } = req.query;
 
   try {
-    const stats = await getBuyerStatsFromDB(userId);  // Fetch stats from DB using userId
-    res.json(stats);
-  } catch (error) {
-    console.error("Error fetching stats:", error);
-    res.status(500).json({ message: "Error fetching stats" });
+    // Fetch notifications based on the user's email
+    const notifications = await Notification.find({ toEmail: email }).sort({ time: -1 });
+
+    // If no notifications found
+    if (notifications.length === 0) {
+      return res.status(200).json([]); // Return an empty array if no notifications
+    }
+
+    res.status(200).json(notifications); // Send notifications as JSON response
+  } catch (err) {
+    console.error("Error fetching notifications:", err);
+    res.status(500).json({ message: "Failed to fetch notifications" });
   }
 });
 
+const getBuyerStatsFromDB = async (userId) => {
+  try {
+    console.log(`Fetching stats for userId: ${userId}`);
+
+    // Use the string userId directly (no ObjectId conversion)
+    const totalTasks = await Task.countDocuments({ buyer_id: userId });
+    console.log(`Total tasks: ${totalTasks}`);
+
+    const pendingTasks = await Task.countDocuments({
+      buyer_id: userId,
+      required_workers: { $gt: 0 },
+    });
+    console.log(`Pending tasks: ${pendingTasks}`);
+
+    const totalPayments = await Payment.aggregate([
+      { $match: { buyer_id: userId } },  // Use userId as a string
+      { $group: { _id: null, totalPayments: { $sum: "$amount" } } },
+    ]);
+    console.log(`Total payments: ${totalPayments}`);
+
+    return {
+      totalTasks,
+      pendingTasks,
+      totalPayments: totalPayments[0] ? totalPayments[0].totalPayments : 0,
+    };
+  } catch (error) {
+    console.error("Error in getBuyerStatsFromDB:", error);
+    throw new Error("Error fetching stats from DB: " + error.message);
+  }
+};
+
+// === API ENDPOINT TO GET BUYER STATS ===
+app.get('/api/buyer/stats/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    if (!userId) {
+      return res.status(400).json({ message: 'User ID is required.' });
+    }
+
+    // Log the received userId
+    console.log(`Received userId: ${userId}`);
+
+    // Fetch stats from DB
+    const stats = await getBuyerStatsFromDB(userId);
+
+    // Log the stats
+    console.log(`Fetched stats: ${JSON.stringify(stats)}`);
+
+    if (!stats) {
+      return res.status(404).json({ message: 'No stats found for this user.' });
+    }
+
+    // Return the stats
+    res.json(stats);
+  } catch (error) {
+    console.error("Error in getting buyer stats:", error);
+    res.status(500).json({ message: 'Internal Server Error', error: error.message });
+  }
+});
 
 // --- Admin Routes ---
 app.get(
@@ -890,9 +1036,26 @@ app.get("/api/worker/submissions", authMiddleware, roleMiddleware("Worker"), asy
 });
 
 
-// --- imgBB Image Upload (registration/task) ---
 app.post("/api/upload-img", authMiddleware, async (req, res) => {
   const { imageBase64 } = req.body;
+
+  if (!imageBase64) {
+    return res.status(400).json({ message: "Image data is required" });
+  }
+
+  // Image Size Validation
+  const imageSize = Buffer.byteLength(imageBase64, 'base64'); // Calculate base64 size
+  if (imageSize > 5 * 1024 * 1024) {  // 5MB size limit
+    return res.status(400).json({ message: "Image size exceeds 5MB" });
+  }
+
+  // Image Type Validation
+  const allowedFormats = ['image/jpeg', 'image/png'];
+  const imgType = imageBase64.split(';')[0].split('/')[1];
+  if (!allowedFormats.includes(`image/${imgType}`)) {
+    return res.status(400).json({ message: "Invalid image format. Only JPG and PNG allowed." });
+  }
+
   try {
     const response = await axios.post(
       `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
