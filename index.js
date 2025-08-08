@@ -1,6 +1,5 @@
 // === ENV SETUP ===
 require("dotenv").config();
-
 // === MODULES ===
 const express = require("express");
 const mongoose = require("mongoose");
@@ -8,12 +7,10 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const axios = require("axios");
-const path = require("path");
-const admin = require("firebase-admin");
-
  
 
-// === FIREBASE INIT ===
+const admin = require("firebase-admin");
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
@@ -22,18 +19,31 @@ admin.initializeApp({
 });
 // === EXPRESS APP ===
 const app = express();
+
 const corsOptions = {
-  origin: ["http://localhost:5173"],
+  origin: [
+    "http://localhost:5173",
+    "https://microtask-and-earning-platform.netlify.app",
+  ],
   credentials: true,
 };
+
 app.use(cors(corsOptions));
 app.use(express.json());
 
 // === MONGOOSE CONNECTION ===
-mongoose
-  .connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log("MongoDB connected"))
-  .catch((err) => console.error("MongoDB connection error:", err));
+ 
+const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URI);
+    console.log('✅ MongoDB connected');
+  } catch (error) {
+    console.error('❌ MongoDB connection failed:', error.message);
+    process.exit(1); // forcefully exit
+  }
+};
+
+
 
 // === JWT TOKEN GENERATOR ===
 const generateToken = (user) => {
@@ -44,6 +54,7 @@ const generateToken = (user) => {
   );
 };
 
+ 
 // === MODELS ===
 const { Schema, model } = mongoose;
 
@@ -109,8 +120,6 @@ const Payment = model("Payment", paymentSchema);
 
 module.exports = { User, Task, Submission, Payment };
 
-
-  
 
 const withdrawalSchema = new Schema({
   worker_id: { type: Schema.Types.ObjectId, ref: "User" },
@@ -290,16 +299,29 @@ app.post("/api/users", async (req, res) => {
 
 app.get('/users/role/:email', async (req, res) => {
   const { email } = req.params;
+
+  if (!email) {
+    return res.status(400).json({ message: "Email parameter is missing" });
+  }
+
   try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "User not found" });
-    
-    // Send both role and coin
-    res.json({ role: user.role, coin: user.coin });
+    const user = await User.findOne({ email }).lean();
+
+    if (!user) {
+      console.warn(`No user found with email: ${email}`);
+      return res.status(200).json({ role: "buyer", coin: 0 }); // fallback
+    }
+
+    return res.status(200).json({
+      role: user.role ?? "buyer",
+      coin: user.coin ?? 0
+    });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    console.error("Error fetching user role and coin:", err.message);
+    return res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
 
 // Google login (Firebase ID token verify)
 app.post("/api/google-login", async (req, res) => {
@@ -558,7 +580,7 @@ app.post("/api/submissions", authMiddleware, roleMiddleware("Worker"), async (re
       payable_amount: task.payable_amount,
       worker_email,
       worker_name,
-      buyer_name,
+      buyer_name:task.buyer_name,
       buyer_email,
       submission_details,
       status: status || "pending", // Default to 'pending' if not provided
@@ -629,6 +651,22 @@ app.post("/api/submissions/:id/approve", authMiddleware, roleMiddleware("Buyer")
   res.json(submission);
 });
 
+app.get('/submissions/buyer/:id', async (req, res) => {
+  const { id } = req.params;
+  console.log("🔍 Looking for buyerId:", id);
+
+  try {
+    const stats = await Submission.find({ buyerId: id });
+    if (!stats.length) {
+      console.warn("No submissions found for buyerId:", id);
+      return res.status(404).json({ message: "No submissions found" });
+    }
+    res.json(stats);
+  } catch (err) {
+    console.error("Server error:", err.message);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
 
 // Reject Submission (Buyer)
 app.post(
@@ -656,7 +694,6 @@ app.post(
     res.json(submission);
   }
 );
-
 
 
 const Stripe = require("stripe");
@@ -782,9 +819,6 @@ app.get("/api/payments", authMiddleware, async (req, res) => {
     res.status(500).json({ message: "Server error fetching payments" });
   }
 });
-
- 
-
 
 
 // --- Withdrawal Routes (Worker) ---
@@ -925,38 +959,19 @@ const getBuyerStatsFromDB = async (userId) => {
 };
 
 // === API ENDPOINT TO GET BUYER STATS ===
-app.get("/api/buyer/stats/:userId", async (req, res) => {
-  const userId = req.params.userId;
-
+app.get("/api/buyer/:userId/stats",authMiddleware, async (req, res) => {
+  const { userId } = req.params;
   try {
-    // Fetch total tasks created by the buyer
-    const totalTasks = await Task.countDocuments({ buyer_id: userId });
-
-    // Fetch total required_workers count for pending tasks
-    const pendingTasks = await Task.aggregate([
-      { $match: { buyer_id: userId } },
-      { $group: { _id: null, totalWorkers: { $sum: "$required_workers" } } },
-    ]);
-
-    // Fetch total payments made by the buyer (assuming payments are stored in a Payment collection)
-    const totalPayments = await Payment.aggregate([
-      { $match: { buyer_id: userId } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-
-    res.json({
-      totalTasks,
-      pendingTasks: pendingTasks.length > 0 ? pendingTasks[0].totalWorkers : 0,
-      totalPayments: totalPayments.length > 0 ? totalPayments[0].total : 0,
-    });
+    const stats = await BuyerStats.findOne({ userId });  
+    if (!stats) {
+      return res.status(404).json({ message: "Stats not found" });
+    }
+    res.json(stats);
   } catch (error) {
-    console.error("Error fetching buyer stats:", error);
-    res.status(500).json({ error: "Failed to fetch buyer stats" });
+    console.error("Error in stats route:", error);
+    res.status(500).json({ message: "Server Error" });
   }
 });
-
-
-
 
 // --- Admin Routes ---
 app.get(
@@ -1019,7 +1034,6 @@ app.post(
     }
   }
 );
-
 
 
 app.get("/api/payments/pending", authMiddleware, roleMiddleware("Admin"), async (req, res) => {
@@ -1143,20 +1157,27 @@ app.post("/api/upload-img", authMiddleware, async (req, res) => {
   }
 });
 
-// Global Error Handler
+
+// middleware & routes setup...
+app.get("/", (req, res) => {
+  res.send("Server is running");
+});
+
+// === GLOBAL ERROR HANDLER ===
 app.use((err, req, res, next) => {
-  console.error(err);
+  console.error("Global error handler:", err);
   res.status(500).json({ message: "Something went wrong", error: err.message });
 });
 
-app.use((req, res, next) => {
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-  next();
+// === SERVER START ===
+const PORT = process.env.PORT || 5000;
+
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+  });
 });
 
-// Start the server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+// === EXPORT APP FOR TESTS OR SERVERLESS IF NEEDED ===
+module.exports = app;
