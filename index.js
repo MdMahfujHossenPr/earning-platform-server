@@ -486,7 +486,7 @@ app.put('/api/tasks/:id', async (req, res) => {
   }
 });
 
-// Delete task
+// Delete tasks
 app.delete("/api/tasks/:id", authMiddleware, roleMiddleware("Buyer"), async (req, res) => {
   const taskId = req.params.id;
 
