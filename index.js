@@ -424,7 +424,7 @@ app.post("/api/tasks", authMiddleware, roleMiddleware("Buyer"), async (req, res)
 // Get tasks (fetch all tasks)
 app.get("/api/tasks", authMiddleware, async (req, res) => {
   try {
-    const { page = 1, limit = 10 } = req.query;  // Default to page 1 and limit 10 tasks
+    const { page = 1, limit = 6 } = req.query;  // Default to page 1 and limit 10 tasks
     
     const tasks = await Task.find()
       .sort({ completion_date: -1 })
